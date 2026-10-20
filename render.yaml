@@ -1,0 +1,16 @@
+# Render Blueprint: New > Blueprint > pick this repo > Apply. Everything below is configured automatically.
+services:
+  - type: web
+    name: mediagrab-engine
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://mediagrab-alpha.vercel.app
+      - key: PLAYLIST_MAX
+        value: "50"
+      - key: FILE_TTL_SECONDS
+        value: "1200"

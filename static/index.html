@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediaGrab</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#0f1115;color:#e8e8ea;margin:0;padding:24px}
+  .box{max-width:720px;margin:0 auto}
+  h1{margin:0 0 16px}
+  .row{display:flex;gap:8px;margin-bottom:12px}
+  input[type=text]{flex:1;padding:12px;border-radius:8px;border:1px solid #333;background:#1a1d24;color:#fff;font-size:15px}
+  button{padding:12px 16px;border:0;border-radius:8px;background:#4f7cff;color:#fff;font-size:15px;cursor:pointer}
+  button.alt{background:#2c3140}
+  button:disabled{opacity:.5;cursor:wait}
+  .card{background:#1a1d24;border-radius:10px;padding:14px;margin-top:14px}
+  .card img.th{width:100%;max-height:260px;object-fit:cover;border-radius:8px}
+  .pfp{width:200px;height:200px;border-radius:50%;object-fit:cover;display:block;margin:8px auto}
+  select{width:100%;padding:10px;border-radius:8px;background:#0f1115;color:#fff;border:1px solid #333;font-size:15px;margin:8px 0}
+  .err{color:#ff7b7b;white-space:pre-wrap}
+  .bar{height:10px;background:#2c3140;border-radius:6px;overflow:hidden;margin-top:8px}
+  .bar div{height:100%;width:0;background:#4f7cff;transition:width .3s}
+  .muted{color:#9aa0ad;font-size:13px}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>MediaGrab</h1>
+  <div class="row">
+    <input id="url" type="text" placeholder="Paste a video / post / profile link (YouTube, TikTok, Instagram, X, Facebook, ...)" autofocus>
+  </div>
+  <div class="row">
+    <button id="btnInfo">Get video &amp; qualities</button>
+    <button id="btnAvatar" class="alt">Get profile picture</button>
+  </div>
+  <div id="msg" class="err"></div>
+
+  <div id="videoCard" class="card" hidden>
+    <img id="thumb" class="th" alt="">
+    <h3 id="title"></h3>
+    <div id="meta" class="muted"></div>
+    <label class="muted">Quality</label>
+    <select id="choice"></select>
+    <button id="btnDl">Download</button>
+    <div class="bar" id="bar" hidden><div></div></div>
+    <div id="status" class="muted"></div>
+  </div>
+
+  <div id="avatarCard" class="card" hidden>
+    <img id="pfp" class="pfp" alt="">
+    <div style="text-align:center"><a id="pfpLink"><button>Download profile picture</button></a></div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let current = null;
+
+async function post(path, body){
+  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j = await r.json();
+  if(!r.ok) throw new Error(j.error || 'Request failed');
+  return j;
+}
+function busy(b){ $('btnInfo').disabled=b; $('btnAvatar').disabled=b; }
+
+$('btnInfo').onclick = async () => {
+  $('msg').textContent=''; $('avatarCard').hidden=true; $('videoCard').hidden=true;
+  busy(true); $('btnInfo').textContent='Loading...';
+  try{
+    const d = await post('/api/info',{url:$('url').value});
+    current = d;
+    $('thumb').src = d.thumbnail || ''; $('thumb').hidden = !d.thumbnail;
+    $('title').textContent = d.title;
+    $('meta').textContent = [d.uploader, d.site, d.duration ? Math.floor(d.duration/60)+':'+String(d.duration%60).padStart(2,'0') : ''].filter(Boolean).join(' · ');
+    const sel = $('choice'); sel.innerHTML='';
+    const g1 = document.createElement('optgroup'); g1.label='Video (MP4)';
+    d.video.forEach(v=>g1.append(new Option(v.label+(v.size?'  (~'+v.size+')':''), v.id)));
+    const g2 = document.createElement('optgroup'); g2.label='Audio only';
+    d.audio.forEach(v=>g2.append(new Option(v.label+(v.size?'  (~'+v.size+')':''), v.id)));
+    if(d.video.length) sel.append(g1); sel.append(g2);
+    $('bar').hidden=true; $('status').textContent='';
+    $('videoCard').hidden=false;
+  }catch(e){ $('msg').textContent=e.message; }
+  busy(false); $('btnInfo').textContent='Get video & qualities';
+};
+
+$('btnDl').onclick = async () => {
+  $('btnDl').disabled=true; $('bar').hidden=false; $('status').textContent='Starting...';
+  try{
+    const {id} = await post('/api/download',{url:current.url, choice:$('choice').value});
+    const timer = setInterval(async()=>{
+      const p = await (await fetch('/api/progress/'+id)).json();
+      $('bar').firstElementChild.style.width=(p.percent||0)+'%';
+      if(p.status==='error'){ clearInterval(timer); $('status').innerHTML='<span class="err"></span>'; $('status').firstChild.textContent=p.error; $('btnDl').disabled=false; }
+      else if(p.status==='done'){ clearInterval(timer); $('status').textContent='Done: '+p.name; $('btnDl').disabled=false;
+        const a=document.createElement('a'); a.href='/api/file/'+id; document.body.append(a); a.click(); a.remove(); }
+      else $('status').textContent=(p.status==='processing'?'Processing / merging...':'Downloading '+(p.percent||0)+'%')+(p.speed?'  '+p.speed:'')+(p.eta?'  ETA '+p.eta:'');
+    },700);
+  }catch(e){ $('status').textContent=e.message; $('btnDl').disabled=false; }
+};
+
+$('btnAvatar').onclick = async () => {
+  $('msg').textContent=''; $('videoCard').hidden=true; $('avatarCard').hidden=true;
+  busy(true); $('btnAvatar').textContent='Looking...';
+  try{
+    const d = await post('/api/avatar',{url:$('url').value});
+    $('pfp').src = d.image;
+    $('pfpLink').href = '/api/avatar-file?u='+encodeURIComponent(d.image)+'&name='+encodeURIComponent(d.name||'profile');
+    $('avatarCard').hidden=false;
+  }catch(e){ $('msg').textContent=e.message; }
+  busy(false); $('btnAvatar').textContent='Get profile picture';
+};
+$('url').addEventListener('keydown',e=>{ if(e.key==='Enter') $('btnInfo').click(); });
+</script>
+</body>
+</html>

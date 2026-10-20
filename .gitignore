@@ -1,0 +1,6 @@
+downloads/
+__pycache__/
+*.log
+cookies.txt
+pl_test.zip
+pl_x/
