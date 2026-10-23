@@ -16,7 +16,9 @@ from urllib.parse import parse_qs, urlparse, quote
 
 import requests
 import yt_dlp
-from flask import Flask, jsonify, request, send_file, send_from_directory
+
+import spotify
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 
 BASE = Path(__file__).resolve().parent
 DL_DIR = BASE / "downloads"
@@ -28,6 +30,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 app = Flask(__name__, static_folder=str(BASE / "static"))
 TASKS = {}  # id -> state dict
+PREVIEWS = {}  # token -> (media url, headers, created)
 
 # ---- public-hosting support -------------------------------------------------
 # ALLOWED_ORIGINS: comma separated site URLs allowed to call this API (default: any).
@@ -77,6 +80,9 @@ def _cleanup_loop():
                     TASKS.pop(d.name, None)
             except OSError:
                 pass
+        for k, v in list(PREVIEWS.items()):
+            if v[2] < time.time() - 3600:
+                PREVIEWS.pop(k, None)
 
 
 threading.Thread(target=_cleanup_loop, daemon=True).start()
@@ -114,7 +120,10 @@ def extract(url, download=False, **opts):
     """Run yt-dlp; if the site demands a login / bot check, retry using cookies from the user's browsers."""
     def run(extra):
         with yt_dlp.YoutubeDL(base_opts(**opts, **extra)) as ydl:
-            return ydl.extract_info(url, download=download)
+            res = ydl.extract_info(url, download=download)
+            if isinstance(res, dict):  # keep the session cookies: some media links (TikTok) need them
+                res["_jar"] = {c.name: c.value for c in ydl.cookiejar}
+            return res
     try:
         return run({})
     except Exception as first:
@@ -232,6 +241,74 @@ def hms(sec):
     sec = int(sec)
     h, m, s_ = sec // 3600, sec % 3600 // 60, sec % 60
     return f"{h}.{m:02d}.{s_:02d}" if h else f"{m}.{s_:02d}"
+
+
+def run_spotify(tid, url, choice, items=None):
+    """Each Spotify track is matched to the same song on YouTube and saved as audio."""
+    t = TASKS[tid]
+    out = DL_DIR / tid
+    out.mkdir(exist_ok=True)
+    try:
+        data = spotify.info(url)
+        tracks = data["tracks"]
+        picked = [(i, tracks[i - 1]) for i in (items or range(1, len(tracks) + 1)) if 0 < i <= len(tracks)][:PLAYLIST_MAX]
+        if not picked:
+            raise RuntimeError("No tracks selected.")
+        fmt, extra = format_for(choice if choice.startswith("a_") else "a_mp3_320")
+        n = len(picked)
+        failed = 0
+        for pos, (i, tr) in enumerate(picked, 1):
+            def hook(d, pos=pos):
+                if d["status"] == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    frac = (d.get("downloaded_bytes") or 0) / total if total else 0
+                    t.update(status="downloading", percent=round(min(((pos - 1) + frac) / n * 100, 99), 1),
+                             item=pos, total=n, speed=human_size(d.get("speed") or 0) + "/s" if d.get("speed") else "")
+            name = safe_name(f"{tr['artist']} - {tr['title']}", limit=110)
+            prefix = f"{pos:03d} - " if n > 1 else ""
+            try:
+                extract(spotify.search_query(tr), True, quiet=True, no_warnings=True, format=fmt,
+                        outtmpl=str(out / f"{prefix}{name}.%(ext)s"), progress_hooks=[hook], windowsfilenames=True,
+                        noplaylist=True, **extra)
+            except Exception:
+                failed += 1
+        files = sorted([p for p in out.iterdir() if p.is_file()], key=lambda p: p.name)
+        if not files:
+            raise RuntimeError("None of the tracks could be found.")
+        if n > 1:
+            t.update(status="processing", percent=99)
+            zp = out / "bundle.zip"
+            with zipfile.ZipFile(zp, "w", zipfile.ZIP_STORED) as z:
+                for f in files:
+                    z.write(f, f.name)
+            t.update(status="done", percent=100, file=str(zp), name=safe_name(data["title"]) + ".zip", count=len(files), failed=failed)
+        else:
+            t.update(status="done", percent=100, file=str(files[0]), name=files[0].name)
+    except Exception as e:  # noqa
+        t.update(status="error", error=clean_err(e))
+
+
+def make_preview(info):
+    """Something the browser can play while choosing the part to cut."""
+    if (info.get("extractor_key") or "").lower() == "youtube" and info.get("id"):
+        return {"type": "youtube", "id": info["id"]}
+    cands = [f for f in (info.get("formats") or [info])
+             if f.get("url") and f.get("vcodec") != "none" and f.get("acodec") != "none"
+             and (f.get("protocol") or "https").startswith("http") and "m3u8" not in (f.get("protocol") or "")
+             and (f.get("ext") or "mp4") in ("mp4", "webm", "mov", "m4v")]
+    if not cands:
+        return None
+    f = min(cands, key=lambda f: abs((f.get("height") or 480) - 480))
+    headers = dict(f.get("http_headers") or {})
+    if f.get("cookies"):  # e.g. TikTok media links only work with the session cookies from the lookup
+        attrs = {"domain", "path", "secure", "expires", "httponly", "max-age", "samesite"}
+        pairs = [c.strip() for c in f["cookies"].split(";") if "=" in c and c.split("=", 1)[0].strip().lower() not in attrs]
+        if pairs:
+            headers["Cookie"] = "; ".join(pairs)
+    tok = uuid.uuid4().hex
+    headers.pop("Cookie", None)
+    PREVIEWS[tok] = (f["url"], headers, time.time(), info.get("_jar") or {})
+    return {"type": "video", "src": f"/api/stream/{tok}"}
 
 
 def run_download(tid, url, choice, playlist=False, items=None, start=None, end=None):
@@ -490,6 +567,23 @@ def api_info():
         return jsonify(error="Paste a link first."), 400
     if not re.match(r"^https?://", url):
         url = "https://" + url
+    if spotify.is_spotify(url):
+        try:
+            sp = spotify.info(url)
+        except Exception as e:
+            return jsonify(error=clean_err(e), url=url), 422
+        _, audio = build_choices({"formats": []})
+        audio = [a for a in audio if a["id"] != "a_best"] + [a for a in audio if a["id"] == "a_best"]
+        if sp["kind"] in ("track", "episode"):
+            tr = sp["tracks"][0]
+            return jsonify(url=url, title=f"{tr['artist']} - {tr['title']}", uploader=tr["artist"], thumbnail=sp["cover"],
+                           duration=int(tr["duration"]) or None, site="Spotify", video=[], audio=audio, spotify=True)
+        items = [{"index": i, "title": f"{tr['artist']} - {tr['title']}", "thumbnail": "", "duration": tr["duration"]}
+                 for i, tr in enumerate(sp["tracks"][:PLAYLIST_MAX], 1)]
+        return jsonify(url=url, is_playlist=True, title=sp["title"], uploader=sp["owner"], thumbnail=sp["cover"],
+                       count=len(items), capped=len(sp["tracks"]) > PLAYLIST_MAX, items=items, site="Spotify",
+                       video=[], audio=audio, spotify=True)
+
     q = urlparse(url)
     qs = q.query
     # pure playlist links are treated as playlists; "watch?v=..&list=.." stays a single video
@@ -524,7 +618,7 @@ def api_info():
     pl_id = parse_qs(qs).get("list", [None])[0]
     return jsonify(url=url, title=info.get("title") or "Untitled", uploader=info.get("uploader") or info.get("channel") or "",
                    thumbnail=info.get("thumbnail") or "", duration=info.get("duration"),
-                   site=info.get("extractor_key"), video=video, audio=audio,
+                   site=info.get("extractor_key"), video=video, audio=audio, preview=make_preview(info),
                    playlist_url=f"https://www.youtube.com/playlist?list={pl_id}" if pl_id and "youtu" in q.netloc else None)
 
 
@@ -540,9 +634,30 @@ def api_download():
         return jsonify(error="Times must look like 1:30 or 0:01:30."), 400
     if start is not None and end is not None and end <= start:
         return jsonify(error="The end time must be after the start time."), 400
+    if spotify.is_spotify(d["url"]):
+        threading.Thread(target=run_spotify, args=(tid, d["url"], d.get("choice", "a_mp3_320"), items), daemon=True).start()
+        return jsonify(id=tid)
     threading.Thread(target=run_download, args=(tid, d["url"], d.get("choice", "vbest"), bool(d.get("playlist")), items, start, end),
                      daemon=True).start()
     return jsonify(id=tid)
+
+
+@app.get("/api/stream/<tok>")
+def api_stream(tok):
+    """Proxies the preview video (with byte ranges, so the player can seek)."""
+    p = PREVIEWS.get(tok)
+    if not p:
+        return jsonify(error="Preview expired - get the video again."), 404
+    media, hdrs, _, jar = p
+    headers = dict(hdrs)
+    if request.headers.get("Range"):
+        headers["Range"] = request.headers["Range"]
+    r = requests.get(media, headers=headers, stream=True, timeout=30, cookies=jar or _cookie_jar())
+    resp = Response(r.iter_content(65536), status=r.status_code, content_type=r.headers.get("Content-Type", "video/mp4"))
+    for k in ("Content-Length", "Content-Range", "Accept-Ranges"):
+        if k in r.headers:
+            resp.headers[k] = r.headers[k]
+    return resp
 
 
 @app.get("/api/progress/<tid>")
