@@ -30,8 +30,12 @@ class Blocked(Exception):
 
 # ------------------------------------------------------------------ client identity
 def client_ip(req):
-    """Real visitor IP. Behind the Cloudflare tunnel every request comes from 127.0.0.1, so trust
-    CF-Connecting-IP (set by Cloudflare, cannot be spoofed through the tunnel)."""
+    """Real visitor IP.
+    - On the server (PROXY_MODE=caddy): Caddy is the only way in and sets X-Real-IP itself, so only that is trusted
+      (a visitor sending a fake CF-Connecting-IP/X-Forwarded-For cannot dodge rate limits).
+    - On the home PC behind the Cloudflare tunnel every request comes from 127.0.0.1, so trust CF-Connecting-IP."""
+    if os.environ.get("PROXY_MODE") == "caddy":
+        return (req.headers.get("X-Real-IP") or req.remote_addr or "unknown").strip()[:64]
     ip = req.headers.get("CF-Connecting-IP") or ""
     if not ip and req.remote_addr not in ("127.0.0.1", "::1"):
         ip = req.remote_addr or ""

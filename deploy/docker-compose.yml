@@ -1,0 +1,39 @@
+# MediaGrab engine on a VPS: Caddy (automatic HTTPS) -> engine. Only Caddy is exposed to the internet.
+services:
+  engine:
+    build: ..
+    restart: unless-stopped
+    environment:
+      PROXY_MODE: caddy
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      PLAYLIST_MAX: "100"
+      MAX_ACTIVE_DOWNLOADS: ${MAX_ACTIVE_DOWNLOADS:-6}
+      MAX_DOWNLOADS_PER_VISITOR: "2"
+      FILE_TTL_SECONDS: "1800"
+      MIN_FREE_DISK_GB: "8"
+    volumes:
+      - downloads:/app/downloads
+      - ./cookies.txt:/app/cookies.txt:ro   # optional login cookies (create an empty file if unused)
+    expose: ["8080"]                        # reachable only from Caddy, never from the internet
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    pids_limit: 512
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [engine]
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+volumes:
+  downloads:
+  caddy_data:
+  caddy_config:

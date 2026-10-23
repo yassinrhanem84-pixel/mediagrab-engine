@@ -1,0 +1,34 @@
+{
+	# hide the server software name
+	servers {
+		timeouts {
+			read_header 10s
+			idle 2m
+		}
+	}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# tiny JSON API: refuse big uploads at the edge
+	request_body {
+		max_size 64KB
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+	}
+
+	reverse_proxy engine:8080 {
+		# Caddy sets the real visitor IP itself; anything a visitor sends in these headers is overwritten
+		header_up X-Real-IP {remote_host}
+		header_up -CF-Connecting-IP
+		flush_interval -1
+		transport http {
+			read_timeout 15m
+			write_timeout 15m
+		}
+	}
+}
