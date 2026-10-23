@@ -18,7 +18,9 @@ import requests
 import yt_dlp
 
 import spotify
-from flask import Flask, Response, jsonify, request, send_file, send_from_directory
+import security as sec
+from security import Blocked
+from flask import Flask, Response, jsonify, request, send_file
 
 BASE = Path(__file__).resolve().parent
 DL_DIR = BASE / "downloads"
@@ -28,44 +30,78 @@ COOKIES = BASE / "cookies.txt"  # optional: export from your browser for login-o
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
-app = Flask(__name__, static_folder=str(BASE / "static"))
+app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024  # API requests are tiny JSON bodies
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(4 * 1024 ** 3)))
 TASKS = {}  # id -> state dict
 PREVIEWS = {}  # token -> (media url, headers, created)
 
 # ---- public-hosting support -------------------------------------------------
 # ALLOWED_ORIGINS: comma separated site URLs allowed to call this API (default: any).
-ALLOWED = [o.strip().rstrip("/") for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", "30"))
+ALLOWED = [o.strip().rstrip("/") for o in os.environ.get(
+    "ALLOWED_ORIGINS", "https://mediagrab-alpha.vercel.app,http://localhost:3000,http://127.0.0.1:3000").split(",") if o.strip()]
 FILE_TTL = int(os.environ.get("FILE_TTL_SECONDS", "1800"))
-_hits = {}  # ip -> [timestamps]
+
+
+def _origin_allowed(origin):
+    return "*" in ALLOWED or origin.rstrip("/") in ALLOWED
 
 
 @app.after_request
-def add_cors(resp):
+def add_headers(resp):
     origin = request.headers.get("Origin", "")
-    if "*" in ALLOWED:
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-    elif origin.rstrip("/") in ALLOWED:
+    if origin and _origin_allowed(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
+        resp.headers["Access-Control-Max-Age"] = "600"
+    resp.headers["Vary"] = "Origin"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; sandbox"
+    resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"  # the site plays previews from here
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.pop("Server", None)
     return resp
 
 
 @app.before_request
-def throttle():
+def guard():
     if request.method == "OPTIONS":
         return ("", 204)
-    if request.path.startswith("/api/") and request.method == "POST":
-        ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or "").split(",")[0].strip()
-        now = time.time()
-        recent = [t for t in _hits.get(ip, []) if now - t < 60]
-        if len(recent) >= RATE_PER_MIN:
-            return jsonify(error="Too many requests - please wait a minute and try again."), 429
-        recent.append(now)
-        _hits[ip] = recent
+    if not request.path.startswith("/api/"):
+        return None
+    ip = sec.client_ip(request)
+    request.environ["mg.ip"] = ip
+    origin = request.headers.get("Origin", "")
+    # browsers always send Origin on cross-site POSTs: refuse other websites piggy-backing on this engine
+    if request.method == "POST" and origin and not _origin_allowed(origin):
+        sec.log.warning("blocked origin %s from %s %s", origin, ip, request.path)
+        return jsonify(error="Not allowed."), 403
+    bucket = {"/api/info": "info", "/api/download": "download", "/api/avatar": "avatar"}.get(request.path, "fetch")
+    if not sec.LIMITS.allow(ip, bucket):
+        sec.log.warning("rate limit %s %s", ip, bucket)
+        return jsonify(error="Too many requests - please wait a minute and try again."), 429
+    return None
+
+
+@app.errorhandler(Blocked)
+def _blocked(e):
+    sec.log.warning("blocked %s %s: %s", request.environ.get("mg.ip"), request.path, e)
+    return jsonify(error=str(e)), 400
+
+
+@app.errorhandler(413)
+def _too_big(_e):
+    return jsonify(error="Request too large."), 413
+
+
+@app.errorhandler(500)
+def _crash(e):
+    sec.log.error("server error on %s: %r", request.path, e)
+    return jsonify(error="Something went wrong. Please try again."), 500
 
 
 def _cleanup_loop():
@@ -80,6 +116,9 @@ def _cleanup_loop():
                     TASKS.pop(d.name, None)
             except OSError:
                 pass
+        for k, v in list(TASKS.items()):
+            if v.get("created", time.time()) < cutoff:
+                TASKS.pop(k, None)
         for k, v in list(PREVIEWS.items()):
             if v[2] < time.time() - 3600:
                 PREVIEWS.pop(k, None)
@@ -142,10 +181,12 @@ def clean_err(e):
     msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
     msg = msg.replace("ERROR: ", "").strip()
     if "not a bot" in msg or "Sign in to confirm" in msg:
-        msg = ("YouTube is asking for a login / bot check. Fix: export your browser cookies to a file named "
-               "cookies.txt (Chrome/Edge/Firefox extension 'Get cookies.txt LOCALLY') and put it next to app.py, "
-               "then try again. Original error: " + msg[:160])
-    return msg
+        sec.log.info("youtube bot-check hit - add cookies.txt next to app.py")
+        msg = "YouTube is temporarily blocking this server. Please try again later."
+    elif "--cookies" in msg or "login" in msg.lower() or "empty media response" in msg:
+        msg = "This site requires a login for that post, so it can't be downloaded right now."
+    msg = re.sub(r"\s*(Use --cookies|See  https?://\S+|Confirm you are on the latest).*$", "", msg, flags=re.S)
+    return sec.scrub(msg)
 
 
 def human_size(n):
@@ -336,7 +377,8 @@ def run_download(tid, url, choice, playlist=False, items=None, start=None, end=N
 
     fmt, extra = format_for(choice)
     tmpl = "%(playlist_index)03d - %(title).70B.%(ext)s" if playlist else "f.%(ext)s"
-    extra_opts = dict(format=fmt, outtmpl=str(out / tmpl), progress_hooks=[hook], windowsfilenames=True, **extra)
+    extra_opts = dict(format=fmt, outtmpl=str(out / tmpl), progress_hooks=[hook], windowsfilenames=True,
+                      max_filesize=MAX_FILE_BYTES, **extra)
     clip = not playlist and (start is not None or end is not None)
     if clip:
         # only download/cut the requested part (ffmpeg cuts on exact times)
@@ -389,7 +431,7 @@ def _get(url, **kw):
         kw["cookies"] = jar
     h = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
     h.update(kw.pop("headers", {}))
-    return requests.get(url, headers=h, **kw)
+    return sec.safe_get(url, headers=h, **kw)
 
 
 def _is_image(url):
@@ -557,16 +599,39 @@ def find_avatar(url):
 # ----------------------------------------------------------------- routes
 @app.get("/")
 def index():
-    return send_from_directory(app.static_folder, "index.html")
+    return jsonify(service="MediaGrab engine", status="ok")
+
+
+def _json():
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        raise Blocked("Bad request.")
+    return d
+
+
+def _clean_url(raw):
+    url = (raw or "").strip() if isinstance(raw, str) else ""
+    if not url:
+        raise Blocked("Paste a link first.")
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    if not spotify.is_spotify(url):
+        sec.check_public_url(url)
+    elif len(url) > 300:
+        raise Blocked("That link is too long.")
+    return url
+
+
+def _run_task(fn, tid, *args):
+    try:
+        fn(tid, *args)
+    finally:
+        sec.SLOTS.release(tid)
 
 
 @app.post("/api/info")
 def api_info():
-    url = (request.json or {}).get("url", "").strip()
-    if not url:
-        return jsonify(error="Paste a link first."), 400
-    if not re.match(r"^https?://", url):
-        url = "https://" + url
+    url = _clean_url(_json().get("url"))
     if spotify.is_spotify(url):
         try:
             sp = spotify.info(url)
@@ -624,20 +689,31 @@ def api_info():
 
 @app.post("/api/download")
 def api_download():
-    d = request.json or {}
-    tid = uuid.uuid4().hex[:12]
-    TASKS[tid] = {"status": "starting", "percent": 0}
-    items = sorted({int(i) for i in d.get("items", []) if str(i).isdigit()})[:PLAYLIST_MAX] or None
+    d = _json()
+    url = _clean_url(d.get("url"))
+    choice = sec.valid_choice(d.get("choice", "vbest"))
+    raw_items = d.get("items") or []
+    if not isinstance(raw_items, list) or len(raw_items) > 1000:
+        raise Blocked("Bad selection.")
+    items = sorted({int(i) for i in raw_items if str(i).isdigit() and 0 < int(i) <= 10000})[:PLAYLIST_MAX] or None
     try:
         start, end = parse_time(d.get("start")), parse_time(d.get("end"))
     except ValueError:
         return jsonify(error="Times must look like 1:30 or 0:01:30."), 400
     if start is not None and end is not None and end <= start:
         return jsonify(error="The end time must be after the start time."), 400
-    if spotify.is_spotify(d["url"]):
-        threading.Thread(target=run_spotify, args=(tid, d["url"], d.get("choice", "a_mp3_320"), items), daemon=True).start()
+    if any(v is not None and not (0 <= v <= 48 * 3600) for v in (start, end)):
+        raise Blocked("Times must be between 0 and 48 hours.")
+    if not sec.disk_ok(DL_DIR):
+        sec.log.error("low disk space - refusing downloads")
+        raise Blocked("The server is busy right now. Please try again later.")
+    tid = uuid.uuid4().hex  # 128-bit: download links can't be guessed
+    sec.SLOTS.acquire(tid, request.environ.get("mg.ip", "?"))
+    TASKS[tid] = {"status": "starting", "percent": 0, "created": time.time()}
+    if spotify.is_spotify(url):
+        threading.Thread(target=_run_task, args=(run_spotify, tid, url, choice, items), daemon=True).start()
         return jsonify(id=tid)
-    threading.Thread(target=run_download, args=(tid, d["url"], d.get("choice", "vbest"), bool(d.get("playlist")), items, start, end),
+    threading.Thread(target=_run_task, args=(run_download, tid, url, choice, bool(d.get("playlist")), items, start, end),
                      daemon=True).start()
     return jsonify(id=tid)
 
@@ -645,15 +721,19 @@ def api_download():
 @app.get("/api/stream/<tok>")
 def api_stream(tok):
     """Proxies the preview video (with byte ranges, so the player can seek)."""
-    p = PREVIEWS.get(tok)
+    p = PREVIEWS.get(tok) if sec.valid_token(tok) else None
     if not p:
         return jsonify(error="Preview expired - get the video again."), 404
     media, hdrs, _, jar = p
     headers = dict(hdrs)
     if request.headers.get("Range"):
         headers["Range"] = request.headers["Range"]
-    r = requests.get(media, headers=headers, stream=True, timeout=30, cookies=jar or _cookie_jar())
-    resp = Response(r.iter_content(65536), status=r.status_code, content_type=r.headers.get("Content-Type", "video/mp4"))
+    r = sec.safe_get(media, headers=headers, stream=True, timeout=30, cookies=jar or _cookie_jar())
+    ctype = r.headers.get("Content-Type", "video/mp4").split(";")[0].strip()
+    if not ctype.startswith(("video/", "audio/", "application/octet-stream", "binary/")):
+        r.close()
+        return jsonify(error="Preview not available."), 415
+    resp = Response(r.iter_content(65536), status=r.status_code, content_type=ctype)
     for k in ("Content-Length", "Content-Range", "Accept-Ranges"):
         if k in r.headers:
             resp.headers[k] = r.headers[k]
@@ -662,30 +742,31 @@ def api_stream(tok):
 
 @app.get("/api/progress/<tid>")
 def api_progress(tid):
-    t = TASKS.get(tid)
+    t = TASKS.get(tid) if sec.valid_token(tid) else None
     if not t:
         return jsonify(error="unknown task"), 404
-    return jsonify({k: v for k, v in t.items() if k != "file"})
+    return jsonify({k: v for k, v in t.items() if k not in ("file", "created")})
 
 
 @app.get("/api/file/<tid>")
 def api_file(tid):
-    t = TASKS.get(tid)
+    t = TASKS.get(tid) if sec.valid_token(tid) else None
     if not t or t.get("status") != "done":
         return jsonify(error="not ready"), 404
-    return send_file(t["file"], as_attachment=True, download_name=t["name"])
+    f = Path(t["file"]).resolve()
+    if DL_DIR.resolve() not in f.parents or not f.is_file():  # never serve anything outside downloads/
+        return jsonify(error="not ready"), 404
+    return send_file(f, as_attachment=True, download_name=t["name"])
 
 
 @app.post("/api/avatar")
 def api_avatar():
-    url = (request.json or {}).get("url", "").strip()
-    if not url:
-        return jsonify(error="Paste a profile or video link first."), 400
-    if not re.match(r"^https?://", url):
-        url = "https://" + url
+    url = _clean_url(_json().get("url"))
     try:
         img, name = find_avatar(url)
         return jsonify(image=img, name=name)
+    except Blocked:
+        raise
     except Exception as e:
         return jsonify(error=clean_err(e)), 422
 
@@ -694,12 +775,25 @@ def api_avatar():
 def api_avatar_file():
     """Proxy the image so the browser can save it with a proper filename."""
     img = request.args.get("u", "")
-    name = re.sub(r'[^\w\-. ]', "_", request.args.get("name", "profile")) or "profile"
-    r = _get(img, stream=True)
-    ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
-    ext = mimetypes.guess_extension(ctype) or ".jpg"
-    ext = ".jpg" if ext == ".jpe" else ext
-    resp = app.response_class(r.iter_content(65536), mimetype=ctype)
+    name = (re.sub(r'[^\w\-. ]', "_", request.args.get("name", "profile"))[:80].strip(". ") or "profile")
+    r = _get(img, stream=True)  # SSRF-checked on every redirect hop
+    ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
+    if r.status_code != 200 or ctype not in ("image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"):
+        r.close()
+        return jsonify(error="That is not an image."), 415
+    if int(r.headers.get("Content-Length") or 0) > 20 * 1024 ** 2:
+        r.close()
+        return jsonify(error="Image too large."), 413
+    ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif"}[ctype]
+
+    def body(limit=20 * 1024 ** 2):
+        sent = 0
+        for chunk in r.iter_content(65536):
+            sent += len(chunk)
+            if sent > limit:
+                break
+            yield chunk
+    resp = app.response_class(body(), mimetype=ctype)
     resp.headers["Content-Disposition"] = f'attachment; filename="{name}_profile{ext}"'
     return resp
 
@@ -708,4 +802,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
     print(f"MediaGrab engine running -> http://localhost:{port}")
-    app.run(host=host, port=port, threaded=True)
+    try:
+        from waitress import serve  # hardened production server (timeouts, connection limits)
+        serve(app, host=host, port=port, threads=24, connection_limit=300, channel_timeout=120,
+              cleanup_interval=30, ident="", max_request_body_size=64 * 1024)
+    except ImportError:
+        app.run(host=host, port=port, threaded=True)
