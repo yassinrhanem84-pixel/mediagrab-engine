@@ -26,6 +26,15 @@ BASE = Path(__file__).resolve().parent
 DL_DIR = BASE / "downloads"
 DL_DIR.mkdir(exist_ok=True)
 COOKIES = BASE / "cookies.txt"  # optional: export from your browser for login-only content
+# On Render the cookies come in as a read-only "Secret File"; yt-dlp rewrites its cookie file, so work on a copy.
+for _src in (os.environ.get("COOKIES_SOURCE", ""), "/etc/secrets/cookies.txt"):
+    if _src and Path(_src).is_file():
+        try:
+            shutil.copyfile(_src, COOKIES)
+            os.chmod(COOKIES, 0o600)
+        except OSError:
+            pass
+        break
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
