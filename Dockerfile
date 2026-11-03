@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
 COPY --chown=app:app . .
-RUN mkdir -p /app/downloads && chown app:app /app/downloads
+RUN mkdir -p /app/downloads && chown -R app:app /app
 
 # never run as root inside the container
 USER app

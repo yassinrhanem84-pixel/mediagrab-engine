@@ -18,7 +18,10 @@ import requests
 
 BASE = Path(__file__).resolve().parent
 log = logging.getLogger("mediagrab.security")
-_fh = logging.FileHandler(BASE / "security.log", encoding="utf-8")
+try:
+    _fh = logging.FileHandler(BASE / "security.log", encoding="utf-8")
+except OSError:  # read-only or unwritable folder (containers): log to the console instead
+    _fh = logging.StreamHandler()
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 log.addHandler(_fh)
 log.setLevel(logging.INFO)
