@@ -1,4 +1,5 @@
 # Render Blueprint: New > Blueprint > pick this repo > Apply. Everything below is configured automatically.
+# Tuned for Render's free machine (512 MB RAM, small temporary disk): one download at a time, small limits.
 services:
   - type: web
     name: mediagrab-engine
@@ -8,9 +9,19 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: PROXY_MODE
+        value: render
       - key: ALLOWED_ORIGINS
         value: https://mediagrab-alpha.vercel.app
       - key: PLAYLIST_MAX
-        value: "50"
+        value: "10"
+      - key: MAX_ACTIVE_DOWNLOADS
+        value: "1"
+      - key: MAX_DOWNLOADS_PER_VISITOR
+        value: "1"
+      - key: MAX_FILE_BYTES
+        value: "1073741824"
+      - key: MIN_FREE_DISK_GB
+        value: "0.5"
       - key: FILE_TTL_SECONDS
-        value: "1200"
+        value: "600"
