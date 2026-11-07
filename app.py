@@ -624,10 +624,11 @@ def _clean_url(raw):
         raise Blocked("Paste a link first.")
     if not re.match(r"^https?://", url, re.I):
         url = "https://" + url
-    if not spotify.is_spotify(url):
-        sec.check_public_url(url)
-    elif len(url) > 300:
-        raise Blocked("That link is too long.")
+    # TikTok-only service: refuse every other site (also keeps the engine from being used as a general downloader)
+    host = (urlparse(url).hostname or "").lower()
+    if not (host == "tiktok.com" or host.endswith(".tiktok.com")):
+        raise Blocked("MediaGrab works with TikTok links only.")
+    sec.check_public_url(url)
     return url
 
 
